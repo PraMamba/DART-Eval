@@ -51,76 +51,212 @@ class CausalZeroShotScore(metaclass=ABCMeta):
         out = (lls * clip_mask).sum(1).numpy(force=True)
 
         return out
+    
+    
+ 
+import torch.multiprocessing as mp
+import logging
+import os
+import time
+import traceback
 
+logging.basicConfig(
+	level=logging.INFO,
+	format="%(asctime)s | %(levelname)s | %(processName)s | %(message)s",
+	datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 class ZeroShotPairedControlEvaluator(metaclass=ABCMeta):
     @abstractmethod
     def __init__(self, dataset, batch_size, num_workers, device):
         self.dataset = dataset
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
+        self.batch_size = batch_size
         self.device = device
 
     @abstractmethod
     def tokenize(self, seqs):
+        """Should return tokens, starts, ends, attention_mask"""
         pass
 
     @abstractmethod
-    def model_fwd(self, tokens_masked, attention_mask, tokens_unmasked):
+    def score(self, tokens, starts, ends, attention_mask):
+        """Compute and return scores for a batch"""
         pass
 
-    # @abstractmethod
-    # def score(self, tokens, starts, ends, attention_mask):
-    #     pass
-    
     def evaluate(self, out_dir, progress_bar=False):
         os.makedirs(out_dir, exist_ok=True)
-        scores_path = os.path.join(out_dir, "scores.tsv")
-        metrics_path = os.path.join(out_dir, "metrics.json")
+        # ✅ 获取可用 GPU 数量并拆分数据
+        num_gpus = torch.cuda.device_count()
+        chunks = torch.utils.data.random_split(
+            self.dataset,
+            [len(self.dataset) // num_gpus + int(i < len(self.dataset) % num_gpus) for i in range(num_gpus)]
+        )
 
+        ctx = mp.get_context("spawn")
+        manager = mp.Manager()
+        # ✅ 共享列表用于存储各进程结果
+        shared_results = manager.list([None] * num_gpus)
+
+        processes = []
+        # 启动所有 GPU 进程
+        for rank in range(num_gpus):
+            part_path = os.path.join(out_dir, f"scores_part{rank}.tsv")
+            p = ctx.Process(
+                target=self._evaluate_worker,
+                args=(chunks[rank], rank, part_path, shared_results, progress_bar)
+            )
+            p.start()
+            processes.append(p)
+
+        # 等待所有进程完成
+        for p in processes:
+            p.join()
+
+        # 合并所有结果
+        all_inds = []
+        all_seq_scores = []
+        all_ctrl_scores = []
+        for rank in range(num_gpus):
+            result = shared_results[rank]
+            if result is None:
+                logging.error(f"[Main] GPU {rank} returned no results.")
+                inds, seq_s, ctrl_s = [], [], []
+            else:
+                inds, seq_s, ctrl_s = result
+            all_inds.extend(inds)
+            all_seq_scores.extend(seq_s)
+            all_ctrl_scores.extend(ctrl_s)
+
+        # 写入合并后的 scores.tsv
+        scores_path = os.path.join(out_dir, "scores.tsv")
         with open(scores_path, "w") as f:
             f.write("idx\tseq_score\tctrl_score\n")
+            # 可选：按索引排序
+            for ind, s, c in sorted(zip(all_inds, all_seq_scores, all_ctrl_scores), key=lambda x: x[0]):
+                f.write(f"{ind}\t{s}\t{c}\n")
 
-            metrics = {}
-            diffs_lst = []
-            corrects_lst = []
-            
-            for seqs, ctrls, inds in tqdm(self.dataloader, disable=(not progress_bar), ncols=120):
-                seq_tokens, seq_starts, seq_ends, seq_attention_mask = self.tokenize(seqs)
-                ctrl_tokens, ctrl_starts, ctrl_ends, ctrl_attention_mask = self.tokenize(ctrls)
+        # 计算指标
+        diffs = np.array(all_seq_scores) - np.array(all_ctrl_scores)
+        corrects = diffs > 0
 
-                seq_scores = self.score(seq_tokens, seq_starts, seq_ends, seq_attention_mask)
-                ctrl_scores = self.score(ctrl_tokens, ctrl_starts, ctrl_ends, ctrl_attention_mask)
-
-                for ind, seq_score, ctrl_score in zip(inds, seq_scores, ctrl_scores):
-                    f.write(f"{ind}\t{seq_score}\t{ctrl_score}\n")
-                f.flush()
-
-                diff_batch = seq_scores - ctrl_scores
-                correct_batch = diff_batch > 0
-
-                diffs_lst.append(diff_batch)
-                corrects_lst.append(correct_batch)
-
-            diffs = np.concatenate(diffs_lst)
-            corrects = np.concatenate(corrects_lst)
-
-        metrics["acc"] = corrects.mean()
-
+        metrics = {
+            "acc": float(corrects.mean())
+        }
         wilcox = wilcoxon(diffs, alternative="greater")
-        metrics["pval"] = float(wilcox.pvalue)
-        metrics["signed_rank_sum"] = float(wilcox.statistic)
-        metrics["mean_diff"] = float(diffs.mean())
-        metrics["q05_diff"] = float(np.percentile(diffs, 5))
-        metrics["q25_diff"] = float(np.percentile(diffs, 25))
-        metrics["median_diff"] = float(np.median(diffs))
-        metrics["q75_diff"] = float(np.percentile(diffs, 75))
-        metrics["q95_diff"] = float(np.percentile(diffs, 95))
+        metrics.update({
+            "pval": float(wilcox.pvalue),
+            "signed_rank_sum": float(wilcox.statistic),
+            "mean_diff": float(diffs.mean()),
+            "q05_diff": float(np.percentile(diffs, 5)),
+            "q25_diff": float(np.percentile(diffs, 25)),
+            "median_diff": float(np.median(diffs)),
+            "q75_diff": float(np.percentile(diffs, 75)),
+            "q95_diff": float(np.percentile(diffs, 95))
+        })
 
+        # 写入 metrics.json
+        metrics_path = os.path.join(out_dir, "metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=4)
 
         return metrics
+
+    # def _evaluate_worker(self, dataset_split, gpu_id, output_file, shared_results, progress_bar):
+    #     try:
+    #         # 设置设备
+    #         torch.cuda.set_device(gpu_id)
+    #         self.device = torch.device(f"cuda:{gpu_id}")
+    #         self.model.to(self.device)
+
+    #         dataloader = DataLoader(dataset_split, batch_size=self.batch_size, shuffle=False, num_workers=0)
+
+    #         inds_list = []
+    #         seq_scores_list = []
+    #         ctrl_scores_list = []
+
+    #         # 写入分块结果
+    #         with open(output_file, "w") as f:
+    #             f.write("idx\tseq_score\tctrl_score\n")
+    #             pbar = tqdm(dataloader,
+    #                         disable=(not progress_bar), ncols=120,
+    #                         position=gpu_id, desc=f"[GPU {gpu_id}]")
+    #             for batch_idx, (seqs, ctrls, inds) in enumerate(pbar):
+    #                 try:
+    #                     seq_tokens, seq_starts, seq_ends, seq_mask = self.tokenize(seqs)
+    #                     ctrl_tokens, ctrl_starts, ctrl_ends, ctrl_mask = self.tokenize(ctrls)
+
+    #                     seq_scores = self.score(seq_tokens, seq_starts, seq_ends, seq_mask)
+    #                     ctrl_scores = self.score(ctrl_tokens, ctrl_starts, ctrl_ends, ctrl_mask)
+
+    #                     for ind, s_score, c_score in zip(inds.tolist(), seq_scores.flatten(), ctrl_scores.flatten()):
+    #                         inds_list.append(ind)
+    #                         seq_scores_list.append(float(s_score))
+    #                         ctrl_scores_list.append(float(c_score))
+    #                         f.write(f"{ind}\t{s_score}\t{c_score}\n")
+    #                     f.flush()
+    #                 except Exception as batch_err:
+    #                     logging.error(f"[GPU {gpu_id}] Error in batch {batch_idx}: {batch_err}")
+    #                     logging.error(traceback.format_exc())
+
+    #         logging.info(f"[GPU {gpu_id}] Finished. Writing result to shared memory.")
+    #         shared_results[gpu_id] = (inds_list, seq_scores_list, ctrl_scores_list)
+
+    #     except Exception as e:
+    #         logging.error(f"[GPU {gpu_id}] Worker failed: {e}")
+    #         logging.error(traceback.format_exc())
+    #         shared_results[gpu_id] = ([], [], [])
+    
+    
+    def _evaluate_worker(self, dataset_split, gpu_id, output_file, shared_results, progress_bar):
+        try:
+            torch.cuda.set_device(gpu_id)
+            self.device = torch.device(f"cuda:{gpu_id}")
+            self.model.to(self.device)
+
+            dataloader = DataLoader(dataset_split, batch_size=self.batch_size, shuffle=False, num_workers=0)
+
+            inds_list = []
+            seq_scores_list = []
+            ctrl_scores_list = []
+
+            with open(output_file, "w") as f:
+                f.write("idx\tseq_score\tctrl_score\n")
+                pbar = tqdm(dataloader, disable=(not progress_bar), ncols=120, position=gpu_id, desc=f"[GPU {gpu_id}]")
+
+                for batch_idx, (seq_tokens, ctrl_tokens, inds) in enumerate(pbar):
+                    try:
+                        seq_tokens = seq_tokens.to(self.device)
+                        ctrl_tokens = ctrl_tokens.to(self.device)
+
+                        seq_mask = (seq_tokens != self.tokenizer.pad_token_id).long()
+                        ctrl_mask = (ctrl_tokens != self.tokenizer.pad_token_id).long()
+
+                        seq_starts = torch.zeros(seq_tokens.size(0), dtype=torch.long, device=self.device)
+                        ctrl_starts = torch.zeros(ctrl_tokens.size(0), dtype=torch.long, device=self.device)
+
+                        seq_ends = seq_mask.sum(dim=1)
+                        ctrl_ends = ctrl_mask.sum(dim=1)
+
+                        seq_scores = self.score(seq_tokens, seq_starts, seq_ends, seq_mask)
+                        ctrl_scores = self.score(ctrl_tokens, ctrl_starts, ctrl_ends, ctrl_mask)
+
+                        for ind, s_score, c_score in zip(inds.tolist(), seq_scores.flatten(), ctrl_scores.flatten()):
+                            inds_list.append(ind)
+                            seq_scores_list.append(float(s_score))
+                            ctrl_scores_list.append(float(c_score))
+                            f.write(f"{ind}\t{s_score}\t{c_score}\n")
+                        f.flush()
+                    except Exception as batch_err:
+                        logging.error(f"[GPU {gpu_id}] Error in batch {batch_idx}: {batch_err}")
+                        logging.error(traceback.format_exc())
+
+            logging.info(f"[GPU {gpu_id}] Finished. Writing result to shared memory.")
+            shared_results[gpu_id] = (inds_list, seq_scores_list, ctrl_scores_list)
+
+        except Exception as e:
+            logging.error(f"[GPU {gpu_id}] Worker failed: {e}")
+            logging.error(traceback.format_exc())
+            shared_results[gpu_id] = ([], [], [])
 
 
 class HFZeroShotEvaluator(ZeroShotPairedControlEvaluator, metaclass=ABCMeta):
@@ -173,7 +309,6 @@ class HFZeroShotEvaluator(ZeroShotPairedControlEvaluator, metaclass=ABCMeta):
 
 class DNABERT2Evaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"zhihan1996/{model_name}"
         with NoModule("triton"):
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             config = BertConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -187,13 +322,14 @@ class DNABERT2Evaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     @property
     def end_token(self):
         return 2
-
+    
+    def score(self, tokens, starts, ends, attention_mask):
+        return MaskedZeroShotScore.score(self, tokens, starts, ends, attention_mask)
 
 class GenaLMEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"AIRI-Institute/{model_name}"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
         super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
 
     @property
@@ -203,11 +339,13 @@ class GenaLMEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     @property
     def end_token(self):
         return 2
+    
+    def score(self, tokens, starts, ends, attention_mask):
+        return MaskedZeroShotScore.score(self, tokens, starts, ends, attention_mask)
 
 
 class HDEvaluator(HFZeroShotEvaluator, CausalZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"LongSafari/{model_name}"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="right")
         model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
         super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
@@ -230,10 +368,12 @@ class HDEvaluator(HFZeroShotEvaluator, CausalZeroShotScore):
             lls[:,1:] = -F.cross_entropy(logits[:,:,:-1], tokens_out[:,1:], reduction="none")
         return lls
     
+    def score(self, tokens, starts, ends, attention_mask):
+        return MaskedZeroShotScore.score(self, tokens, starts, ends, attention_mask)
+    
 
 class CaduceusEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"kuleshov-group/{model_name}"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="right")
         model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
         super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
@@ -258,7 +398,6 @@ class CaduceusEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
 
 class MistralEvaluator(HFZeroShotEvaluator, CausalZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"RaphaelMourad/{model_name}"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
         super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
@@ -285,7 +424,6 @@ class MistralEvaluator(HFZeroShotEvaluator, CausalZeroShotScore):
 
 class NTEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     def __init__(self, model_name, dataset, batch_size, num_workers, device):
-        model_name = f"InstaDeepAI/{model_name}"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
         super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
@@ -297,3 +435,34 @@ class NTEvaluator(HFZeroShotEvaluator, MaskedZeroShotScore):
     @property
     def end_token(self):
         return None
+    
+    def score(self, tokens, starts, ends, attention_mask):
+        return MaskedZeroShotScore.score(self, tokens, starts, ends, attention_mask)
+    
+
+class GENERatorEvaluator(HFZeroShotEvaluator, CausalZeroShotScore):
+    def __init__(self, model_name, dataset, batch_size, num_workers, device):
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+        super().__init__(tokenizer, model, dataset, batch_size, num_workers, device)
+
+    @property
+    def start_token(self):
+        return None
+    
+    @property
+    def end_token(self):
+        return 1
+    
+    def model_fwd(self, tokens_in, attention_mask, tokens_out):
+        with torch.no_grad():
+            torch_outs = self.model(
+                tokens_in,
+            )
+            logits = torch_outs.logits.swapaxes(1, 2)
+            lls = torch.zeros(tokens_out.shape[:2], device=self.device)
+            lls[:,1:] = -F.cross_entropy(logits[:,:,:-1], tokens_out[:,1:], reduction="none")
+        return lls
+    
+    def score(self, tokens, starts, ends, attention_mask):
+        return MaskedZeroShotScore.score(self, tokens, starts, ends, attention_mask)
